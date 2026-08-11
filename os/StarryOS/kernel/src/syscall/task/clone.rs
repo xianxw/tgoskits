@@ -2,7 +2,6 @@ use alloc::sync::Arc;
 
 use ax_errno::{AxError, AxResult};
 use ax_fs_ng::vfs::FS_CONTEXT;
-use ax_kspin::SpinNoIrq;
 use ax_runtime::hal::cpu::uspace::UserContext;
 use ax_task::{AxTaskExt, current, spawn_task_with};
 use bitflags::bitflags;
@@ -15,6 +14,7 @@ use starry_vm::VmMutPtr;
 use crate::{
     file::{FD_TABLE, FileLike, PidFd, close_file_like},
     mm::copy_from_kernel,
+    sync::SpinLock,
     task::{AsThread, ProcessData, ProcessImage, Thread, add_task_to_table, new_user_task},
 };
 
@@ -260,23 +260,28 @@ impl CloneArgs {
             let signal_actions = if flags.contains(CloneFlags::SIGHAND) {
                 old_proc_data.signal.actions()
             } else if flags.contains(CloneFlags::CLEAR_SIGHAND) {
-                Arc::new(SpinNoIrq::new(Default::default()))
+                Arc::new(SpinLock::new(Default::default()))
             } else {
-                Arc::new(SpinNoIrq::new(
-                    old_proc_data.signal.actions().lock().clone(),
+                Arc::new(SpinLock::new(
+                    old_proc_data.signal.actions().lock_irqsave().clone(),
                 ))
             };
 
+            // RwLock read guards used as nested call arguments live until the
+            // outer statement ends. Build the plain image first so all six
+            // preemption guards are gone before `ProcessData::new` acquires
+            // the sleepable address-space mutex.
+            let process_image = ProcessImage::new(
+                old_proc_data.exe_path.read().clone(),
+                old_proc_data.cmdline.read().clone(),
+                old_proc_data.envp.read().clone(),
+                old_proc_data.auxv.read().clone(),
+                old_proc_data.root_path.read().clone(),
+                old_proc_data.cwd_path.read().clone(),
+            );
             let proc_data = ProcessData::new(
                 proc,
-                ProcessImage::new(
-                    old_proc_data.exe_path.read().clone(),
-                    old_proc_data.cmdline.read().clone(),
-                    old_proc_data.envp.read().clone(),
-                    old_proc_data.auxv.read().clone(),
-                    old_proc_data.root_path.read().clone(),
-                    old_proc_data.cwd_path.read().clone(),
-                ),
+                process_image,
                 aspace,
                 signal_actions,
                 exit_signal,
