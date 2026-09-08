@@ -918,6 +918,7 @@ dependencies = [
 name = "ax-fs-ng"
 version = "0.9.3"
 dependencies = [
+ "atomic-waker",
  "ax-io",
  "ax-lazyinit",
  "ax-sync",
@@ -926,6 +927,7 @@ dependencies = [
  "cfg-if",
  "chrono",
  "dma-api",
+ "event-listener",
  "hashbrown 0.16.1",
  "intrusive-collections",
  "irq-framework",

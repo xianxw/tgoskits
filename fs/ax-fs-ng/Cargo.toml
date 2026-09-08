@@ -15,6 +15,7 @@ vfs = ["ax-sync/sleep"]
 lockdep = ["axfs-ng-vfs/lockdep"]
 
 [dependencies]
+atomic-waker.workspace = true
 axfs-ng-vfs = { workspace = true }
 ax-io = { workspace = true, features = ["alloc"] }
 ax-lazyinit.workspace = true
@@ -23,6 +24,7 @@ bitflags = "2.10"
 cfg-if = { workspace = true }
 chrono = { workspace = true }
 dma-api = { workspace = true }
+event-listener.workspace = true
 hashbrown = "0.16"
 intrusive-collections = "0.9"
 irq-framework = { workspace = true }

@@ -1,6 +1,7 @@
 mod controller;
 mod device;
 mod io;
+mod submission;
 
 use alloc::{
     boxed::Box,
@@ -18,6 +19,7 @@ use core::{
 use ax_lazyinit::OnceLock;
 use controller::{ControllerIrqToken, ControllerPort, run_controller};
 use device::{CpuSubmissionChannel, DeviceInfoEpoch};
+use event_listener::Event;
 use irq_framework::IrqId;
 #[cfg(any(feature = "ext4", feature = "fat"))]
 use rdif_block::RequestFlags;
@@ -878,6 +880,9 @@ struct DeviceInner {
     data_gate_waiters: TaskWaiters,
     flush_gate_waiters: TaskWaiters,
     data_drain_waiters: TaskWaiters,
+    admission_event: Event,
+    #[cfg(test)]
+    admission_wait_hook: IrqMutex<Option<Box<dyn FnOnce() + Send>>>,
     state_notification: Arc<dyn BlockNotification>,
     lifecycle_gate: IrqMutex<LifecycleGateState>,
     shutdown_waiters: TaskWaiters,
@@ -933,6 +938,36 @@ impl LifecycleGateState {
             teardown_in_progress: false,
             terminal_teardown_error: None,
         }
+    }
+
+    fn try_admit_data(&mut self, count: usize) -> Result<bool, BlkError> {
+        if count == 0 {
+            return Err(BlkError::InvalidRequest);
+        }
+        if self.phase != DevicePhase::Ready {
+            return Err(BlkError::Io);
+        }
+        if self.flush_active {
+            return Ok(false);
+        }
+        self.active_data = self
+            .active_data
+            .checked_add(count)
+            .ok_or(BlkError::InvalidRequest)?;
+        Ok(true)
+    }
+
+    /// `None` means another flush owns the gate. `Some` claims it and reports
+    /// whether all prior data submissions have already drained.
+    fn try_admit_flush(&mut self) -> Result<Option<bool>, BlkError> {
+        if self.phase != DevicePhase::Ready {
+            return Err(BlkError::Io);
+        }
+        if self.flush_active {
+            return Ok(None);
+        }
+        self.flush_active = true;
+        Ok(Some(self.active_data == 0))
     }
 }
 
@@ -1020,6 +1055,9 @@ impl BlockDeviceHandle {
             data_gate_waiters: TaskWaiters::new(),
             flush_gate_waiters: TaskWaiters::new(),
             data_drain_waiters: TaskWaiters::new(),
+            admission_event: Event::new(),
+            #[cfg(test)]
+            admission_wait_hook: IrqMutex::new(None),
             state_notification: ops.notification(),
             lifecycle_gate: IrqMutex::new(LifecycleGateState::new()),
             shutdown_waiters: TaskWaiters::new(),
@@ -1145,8 +1183,7 @@ impl BlockDeviceHandle {
         let Some(cpu_channel) = self.inner.select_cpu_channel() else {
             return Err(BatchSubmitError::new(BlkError::Io, requests));
         };
-        let mut info = cpu_channel.hctx.info();
-        info.device = self.inner.published_device_info();
+        let info = self.inner.effective_queue_info(&cpu_channel);
         let validation_error = requests
             .iter()
             .find_map(|request| validate_owned_request(info, request).err());
@@ -1222,15 +1259,7 @@ impl BlockDeviceHandle {
                 },
                 count,
             );
-            let terminal = {
-                let gate = self.inner.lifecycle_gate.lock();
-                gate.phase != DevicePhase::Ready
-            };
-            let error = if terminal {
-                BlkError::Io
-            } else {
-                BlkError::Retry
-            };
+            let error = self.inner.closed_submission_error();
             let submissions = match send_error {
                 SendError::Closed(submissions) | SendError::Full(submissions) => submissions,
             };

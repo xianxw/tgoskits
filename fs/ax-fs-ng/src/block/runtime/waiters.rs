@@ -1,3 +1,5 @@
+#[cfg(test)]
+use alloc::boxed::Box;
 use alloc::{sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
@@ -13,12 +15,16 @@ use crate::{
 /// before rechecking the predicate closes the transition-to-sleep race.
 pub(super) struct TaskWaiters {
     notifications: IrqMutex<Vec<Arc<dyn BlockNotification>>>,
+    #[cfg(test)]
+    registration_hook: IrqMutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl TaskWaiters {
     pub(super) const fn new() -> Self {
         Self {
             notifications: IrqMutex::new(Vec::new()),
+            #[cfg(test)]
+            registration_hook: IrqMutex::new(None),
         }
     }
 
@@ -29,6 +35,8 @@ impl TaskWaiters {
     pub(super) fn wait_while(&self, should_wait: impl FnOnce() -> bool) -> BlockResult {
         let notification = runtime_ops()?.notification();
         self.notifications.lock().push(Arc::clone(&notification));
+        #[cfg(test)]
+        self.run_registration_hook();
 
         if should_wait() {
             notification.wait();
@@ -74,6 +82,26 @@ impl TaskWaiters {
     pub(super) fn len(&self) -> usize {
         self.notifications.lock().len()
     }
+
+    #[cfg(test)]
+    pub(super) fn set_registration_hook(&self, hook: impl FnOnce() + Send + 'static) {
+        let previous = self
+            .registration_hook
+            .lock()
+            .replace(alloc::boxed::Box::new(hook));
+        assert!(
+            previous.is_none(),
+            "waiter registration hook already installed"
+        );
+    }
+
+    #[cfg(test)]
+    fn run_registration_hook(&self) {
+        let hook = self.registration_hook.lock().take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
 }
 
 struct CapacityWaiter {
@@ -89,6 +117,8 @@ struct CapacityWaiter {
 pub(super) struct CapacityWaiters {
     waiters: IrqMutex<Vec<CapacityWaiter>>,
     count: AtomicUsize,
+    #[cfg(test)]
+    registration_hook: IrqMutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl CapacityWaiters {
@@ -96,6 +126,8 @@ impl CapacityWaiters {
         Self {
             waiters: IrqMutex::new(Vec::new()),
             count: AtomicUsize::new(0),
+            #[cfg(test)]
+            registration_hook: IrqMutex::new(None),
         }
     }
 
@@ -113,6 +145,8 @@ impl CapacityWaiters {
             });
             self.count.store(waiters.len(), Ordering::Release);
         }
+        #[cfg(test)]
+        self.run_registration_hook();
 
         let available = available();
         if available >= required {
@@ -174,5 +208,25 @@ impl CapacityWaiters {
     #[cfg(test)]
     pub(super) fn len(&self) -> usize {
         self.count.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_registration_hook(&self, hook: impl FnOnce() + Send + 'static) {
+        let previous = self
+            .registration_hook
+            .lock()
+            .replace(alloc::boxed::Box::new(hook));
+        assert!(
+            previous.is_none(),
+            "capacity registration hook already installed"
+        );
+    }
+
+    #[cfg(test)]
+    fn run_registration_hook(&self) {
+        let hook = self.registration_hook.lock().take();
+        if let Some(hook) = hook {
+            hook();
+        }
     }
 }
