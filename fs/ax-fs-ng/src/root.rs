@@ -30,7 +30,7 @@ static ROOT_BLOCK_REGION: OnceLock<BlockRegion> = OnceLock::new();
 #[cfg(axtest)]
 static AXTEST_SCRATCH_REGION: OnceLock<Option<BlockRegion>> = OnceLock::new();
 #[cfg(axtest)]
-static AXTEST_ROOT_DISK_PARTITION_REGIONS: OnceLock<Vec<BlockRegion>> = OnceLock::new();
+static AXTEST_DISK_PARTITION_REGIONS: OnceLock<Vec<(usize, Vec<BlockRegion>)>> = OnceLock::new();
 
 /// Linux-facing identity of the selected physical root block device.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -236,12 +236,28 @@ pub fn init_root(
     #[cfg(axtest)]
     AXTEST_SCRATCH_REGION.call_once(|| parse_axtest_scratch_region(bootargs));
     #[cfg(axtest)]
-    AXTEST_ROOT_DISK_PARTITION_REGIONS.call_once(|| {
-        selected
-            .partitions
+    AXTEST_DISK_PARTITION_REGIONS.call_once(|| {
+        let mut entries: Vec<(usize, Vec<BlockRegion>)> = disks
             .iter()
-            .map(|partition| partition.info.region)
-            .collect()
+            .map(|disk| {
+                (
+                    Arc::as_ptr(&disk.handle) as usize,
+                    disk.partitions
+                        .iter()
+                        .map(|partition| partition.info.region)
+                        .collect(),
+                )
+            })
+            .collect();
+        entries.push((
+            Arc::as_ptr(&selected.handle) as usize,
+            selected
+                .partitions
+                .iter()
+                .map(|partition| partition.info.region)
+                .collect(),
+        ));
+        entries
     });
 
     let root = if let Some(kind) = selected_filesystem_kind(
@@ -294,14 +310,20 @@ pub fn axtest_scratch_region_request() -> Option<BlockRegion> {
     *requested
 }
 
-/// Returns every partition region identified on the root disk. The
-/// destructive axtests must not overlap any of them: init_root mounts the
-/// non-root partitions alongside the root filesystem.
+/// Returns every partition region identified on the disk that owns
+/// `handle`. The destructive axtests must not overlap any of them:
+/// init_root mounts the non-root partitions alongside the root filesystem.
 #[cfg(axtest)]
-pub fn axtest_root_disk_partition_regions() -> &'static [BlockRegion] {
-    AXTEST_ROOT_DISK_PARTITION_REGIONS
+pub fn axtest_disk_partition_regions(handle: &BlockDeviceHandle) -> &'static [BlockRegion] {
+    let ptr = handle as *const BlockDeviceHandle as usize;
+    AXTEST_DISK_PARTITION_REGIONS
         .get()
-        .map(|regions| regions.as_slice())
+        .and_then(|entries| {
+            entries
+                .iter()
+                .find(|(entry_ptr, _)| *entry_ptr == ptr)
+                .map(|(_, regions)| regions.as_slice())
+        })
         .unwrap_or(&[])
 }
 

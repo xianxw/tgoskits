@@ -88,3 +88,17 @@ Each sequential case transfers 8 MiB. The eight concurrent workers transfer
 2 MiB each; these sizes keep the depth-one hardware queue validation bounded
 while still exercising thousands of 512-byte submissions and every required
 ADMA2 split boundary.
+
+## Measurement boundary
+
+This benchmark measures the **full file-I/O stack** of the running StarryOS
+image: VFS, ext4, page cache, the block runtime and the hardware controller.
+Reported per-operation latencies include syscall overhead and scheduling, so
+they are **not** raw block-request latencies, and the numbers must not be
+read as a sync-versus-async block submission comparison.
+
+Raw request-level correctness (registration consistency, asynchronous
+completion and waker delivery, contiguous and multi-descriptor write-read
+integrity, scratch-region restore) is covered by the kernel's
+`block_runtime_axtest` regressions, which are discovered, selected and
+executed by the standard CI `axtest_kernel` entry.
