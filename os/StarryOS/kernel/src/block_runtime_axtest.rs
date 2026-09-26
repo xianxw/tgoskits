@@ -144,6 +144,7 @@ fn writable_test_device() -> Option<(Arc<BlockDeviceHandle>, BlockRegion)> {
         return Some((device, scratch));
     }
 
+    let scratch = BlockRegion::new(1, u64::from(SCRATCH_MIN_REGION_BLOCKS));
     let candidates = devices
         .iter()
         .filter(|device| {
@@ -151,19 +152,18 @@ fn writable_test_device() -> Option<(Arc<BlockDeviceHandle>, BlockRegion)> {
         })
         .filter(|device| {
             let info = device.device_info();
-            if info.num_blocks < u64::from(SCRATCH_MIN_REGION_BLOCKS) + 1
+            if info.num_blocks < scratch.end_lba
                 || info.logical_block_size < SCRATCH_DISK_MARKER.len()
             {
                 return false;
             }
             // init_root mounts every recognized partition on this disk too,
-            // so the fixed scratch extent [1, 1 + SCRATCH_MIN_REGION_BLOCKS)
-            // must not overlap any of them before raw writes are allowed.
+            // so the fixed scratch extent must not overlap any of them
+            // before raw writes are allowed.
             if !ax_fs_ng::root::axtest_disk_partition_regions(device)
                 .iter()
                 .all(|partition| {
-                    u64::from(SCRATCH_MIN_REGION_BLOCKS) <= partition.start_lba
-                        || partition.end_lba <= 1
+                    scratch.end_lba <= partition.start_lba || partition.end_lba <= scratch.start_lba
                 })
             {
                 return false;
@@ -186,7 +186,6 @@ fn writable_test_device() -> Option<(Arc<BlockDeviceHandle>, BlockRegion)> {
         })
         .collect::<Vec<_>>();
     let device = Arc::clone(*candidates.first()?);
-    let scratch = BlockRegion::new(1, u64::from(SCRATCH_MIN_REGION_BLOCKS));
     log_write_device(&device, &scratch);
     Some((device, scratch))
 }
