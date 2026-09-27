@@ -28,7 +28,7 @@ static ROOT_BLOCK_HANDLE: OnceLock<usize> = OnceLock::new();
 #[cfg(axtest)]
 static ROOT_BLOCK_REGION: OnceLock<BlockRegion> = OnceLock::new();
 #[cfg(axtest)]
-static AXTEST_SCRATCH_REGION: OnceLock<Option<BlockRegion>> = OnceLock::new();
+static AXTEST_SCRATCH_REGION: OnceLock<Option<Result<BlockRegion, String>>> = OnceLock::new();
 #[cfg(axtest)]
 static AXTEST_DISK_PARTITION_REGIONS: OnceLock<Vec<(usize, Vec<BlockRegion>)>> = OnceLock::new();
 
@@ -302,12 +302,15 @@ pub fn axtest_root_region(handle: &BlockDeviceHandle) -> Option<BlockRegion> {
 }
 
 /// Returns the destructive-write scratch region requested on the kernel
-/// command line (`axtest.block_scratch=<start_lba>:<blocks>`), if any. The
-/// destructive axtests write only inside this region.
+/// command line (`axtest.block_scratch=<start_lba>:<blocks>`). `None` when
+/// the command line does not mention it; a present but malformed declaration
+/// is returned as `Err` so callers fail loudly instead of silently falling
+/// back to another disk.
 #[cfg(axtest)]
-pub fn axtest_scratch_region_request() -> Option<BlockRegion> {
-    let requested = AXTEST_SCRATCH_REGION.get()?;
-    *requested
+pub fn axtest_scratch_region_request() -> Option<&'static Result<BlockRegion, String>> {
+    AXTEST_SCRATCH_REGION
+        .get()
+        .and_then(|requested| requested.as_ref())
 }
 
 /// Returns every partition region identified on the disk that owns
@@ -328,15 +331,34 @@ pub fn axtest_disk_partition_regions(handle: &BlockDeviceHandle) -> &'static [Bl
 }
 
 #[cfg(axtest)]
-fn parse_axtest_scratch_region(bootargs: Option<&str>) -> Option<BlockRegion> {
-    let value = bootargs?.split_ascii_whitespace().find_map(|arg| {
-        arg.strip_prefix("axtest.block_scratch=")
-            .filter(|value| !value.is_empty())
-    })?;
-    let (start_lba, block_count) = value.split_once(':')?;
-    let start_lba = start_lba.parse::<u64>().ok()?;
-    let block_count = block_count.parse::<u64>().ok()?;
-    (block_count != 0).then_some(BlockRegion::new(start_lba, block_count))
+fn parse_axtest_scratch_region(bootargs: Option<&str>) -> Option<Result<BlockRegion, String>> {
+    // Absent on the command line -> None (the caller falls back). A present
+    // but malformed declaration is reported as Err so the destructive tests
+    // fail loudly instead of silently running against another disk.
+    let value = bootargs?
+        .split_ascii_whitespace()
+        .find_map(|arg| arg.strip_prefix("axtest.block_scratch="))?;
+    let Some((start_lba, block_count)) = value.split_once(':') else {
+        return Some(Err(format!(
+            "axtest.block_scratch expects <start_lba>:<blocks>, got {value:?}"
+        )));
+    };
+    let Ok(start_lba) = start_lba.parse::<u64>() else {
+        return Some(Err(format!(
+            "axtest.block_scratch start_lba {start_lba:?} is not an integer"
+        )));
+    };
+    let Ok(block_count) = block_count.parse::<u64>() else {
+        return Some(Err(format!(
+            "axtest.block_scratch blocks {block_count:?} is not an integer"
+        )));
+    };
+    if block_count == 0 {
+        return Some(Err(
+            "axtest.block_scratch blocks must be nonzero".to_string()
+        ));
+    }
+    Some(Ok(BlockRegion::new(start_lba, block_count)))
 }
 
 const SD_NAMES: [&str; 26] = [

@@ -1,7 +1,7 @@
 use std::{
     env,
     fs::{self, File, OpenOptions},
-    io::{self, BufReader, Read, Write},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     sync::{Arc, Barrier},
     thread,
@@ -400,7 +400,9 @@ fn verify_file(
     bytes: usize,
     read_latencies: &mut Vec<u64>,
 ) -> io::Result<()> {
-    let mut reader = BufReader::new(File::open(path)?);
+    // Deliberately unbuffered: every read must cross the syscall/filesystem
+    // boundary so the recorded latencies cover the full file-I/O path.
+    let mut file = File::open(path)?;
     let mut actual = vec![0; block_size];
     let mut expected = vec![0; block_size];
     let mut offset = 0usize;
@@ -408,7 +410,7 @@ fn verify_file(
     while offset < bytes {
         let chunk_len = (bytes - offset).min(block_size);
         let op_start = Instant::now();
-        reader.read_exact(&mut actual[..chunk_len])?;
+        file.read_exact(&mut actual[..chunk_len])?;
         read_latencies.push(op_start.elapsed().as_nanos() as u64);
         fill_pattern(&mut expected[..chunk_len], block_size, offset);
         if actual[..chunk_len] != expected[..chunk_len] {
@@ -432,14 +434,14 @@ fn verify_worker_file(
     bytes: usize,
     worker_id: usize,
 ) -> io::Result<()> {
-    let mut reader = BufReader::new(File::open(path)?);
+    let mut file = File::open(path)?;
     let mut actual = vec![0; block_size];
     let mut expected = vec![0; block_size];
     let mut offset = 0usize;
 
     while offset < bytes {
         let chunk_len = (bytes - offset).min(block_size);
-        reader.read_exact(&mut actual[..chunk_len])?;
+        file.read_exact(&mut actual[..chunk_len])?;
         fill_pattern_for_worker(&mut expected[..chunk_len], block_size, offset, worker_id);
         if actual[..chunk_len] != expected[..chunk_len] {
             return Err(io::Error::new(

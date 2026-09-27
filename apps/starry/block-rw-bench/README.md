@@ -100,5 +100,10 @@ read as a sync-versus-async block submission comparison.
 Raw request-level correctness (registration consistency, asynchronous
 completion and waker delivery, contiguous and multi-descriptor write-read
 integrity, scratch-region restore) is covered by the kernel's
-`block_runtime_axtest` regressions, which are discovered, selected and
-executed by the standard CI `axtest_kernel` entry.
+`block_runtime_axtest` regressions. The standard CI `axtest_kernel` entry
+discovers and runs that suite, but a board environment without a configured
+scratch region makes the write cases self-skip
+(`BLOCK_WRITE_TESTS_SKIPPED`): only the read cases execute under plain CI.
+The write-read coverage therefore depends on running the suite on hardware
+whose kernel command line declares the scratch region
+(`axtest.block_scratch=<start_lba>:<blocks>`).

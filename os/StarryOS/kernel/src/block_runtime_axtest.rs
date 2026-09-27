@@ -95,53 +95,62 @@ fn writable_test_device() -> Option<(Arc<BlockDeviceHandle>, BlockRegion)> {
     let devices = BlockDeviceHandle::axtest_devices()
         .expect("block runtime must be installed for block axtest");
 
-    if let Some(scratch) = ax_fs_ng::root::axtest_scratch_region_request() {
-        let candidates = devices
-            .iter()
-            .filter(|device| !device.device_info().read_only)
-            .filter(|device| {
-                let info = device.device_info();
-                // The region must be large enough for every test layout
-                // (the functional sub-regions and the multi-descriptor test
-                // together need 40 blocks).
-                info.logical_block_size == 512
-                    && scratch.num_blocks() >= u64::from(SCRATCH_MIN_REGION_BLOCKS)
-                    && scratch.end_lba <= info.num_blocks
-            })
-            .filter(|device| {
-                // The reserved extent lives on the root SD card; do not fall
-                // back to an unrelated writable disk whose fixed LBA range has
-                // not been explicitly identified as scratch space.
-                ax_fs_ng::root::axtest_is_root_device(device)
-            })
-            .filter(|device| {
-                let Some(root) = ax_fs_ng::root::axtest_root_region(device) else {
-                    return false;
-                };
-                scratch.end_lba <= root.start_lba || root.end_lba <= scratch.start_lba
-            })
-            .filter(|device| {
-                // init_root mounts every other recognized partition on this
-                // disk too (a /boot partition, for example), so the scratch
-                // extent must avoid all of them, not just the root one.
-                ax_fs_ng::root::axtest_disk_partition_regions(device)
-                    .iter()
-                    .all(|partition| {
-                        scratch.end_lba <= partition.start_lba
-                            || partition.end_lba <= scratch.start_lba
-                    })
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            candidates.len(),
-            1,
-            "requested scratch region [{}, {}) matches no eligible device",
-            scratch.start_lba,
-            scratch.end_lba,
-        );
-        let device = Arc::clone(candidates[0]);
-        log_write_device(&device, &scratch);
-        return Some((device, scratch));
+    // An explicit bootargs declaration is a hard commitment: a malformed one
+    // fails the destructive tests instead of falling back to the marker path
+    // or reporting a silent skip.
+    match ax_fs_ng::root::axtest_scratch_region_request() {
+        Some(Ok(scratch)) => {
+            let candidates = devices
+                .iter()
+                .filter(|device| !device.device_info().read_only)
+                .filter(|device| {
+                    let info = device.device_info();
+                    // The region must be large enough for every test layout
+                    // (the functional sub-regions and the multi-descriptor test
+                    // together need 40 blocks).
+                    info.logical_block_size == 512
+                        && scratch.num_blocks() >= u64::from(SCRATCH_MIN_REGION_BLOCKS)
+                        && scratch.end_lba <= info.num_blocks
+                })
+                .filter(|device| {
+                    // The reserved extent lives on the root SD card; do not fall
+                    // back to an unrelated writable disk whose fixed LBA range has
+                    // not been explicitly identified as scratch space.
+                    ax_fs_ng::root::axtest_is_root_device(device)
+                })
+                .filter(|device| {
+                    let Some(root) = ax_fs_ng::root::axtest_root_region(device) else {
+                        return false;
+                    };
+                    scratch.end_lba <= root.start_lba || root.end_lba <= scratch.start_lba
+                })
+                .filter(|device| {
+                    // init_root mounts every other recognized partition on this
+                    // disk too (a /boot partition, for example), so the scratch
+                    // extent must avoid all of them, not just the root one.
+                    ax_fs_ng::root::axtest_disk_partition_regions(device)
+                        .iter()
+                        .all(|partition| {
+                            scratch.end_lba <= partition.start_lba
+                                || partition.end_lba <= scratch.start_lba
+                        })
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                candidates.len(),
+                1,
+                "requested scratch region [{}, {}) matches no eligible device",
+                scratch.start_lba,
+                scratch.end_lba,
+            );
+            let device = Arc::clone(candidates[0]);
+            log_write_device(&device, &scratch);
+            return Some((device, *scratch));
+        }
+        Some(Err(reason)) => {
+            panic!("axtest.block_scratch was declared on the command line but is invalid: {reason}")
+        }
+        None => {}
     }
 
     let scratch = BlockRegion::new(1, u64::from(SCRATCH_MIN_REGION_BLOCKS));
@@ -185,7 +194,16 @@ fn writable_test_device() -> Option<(Arc<BlockDeviceHandle>, BlockRegion)> {
             bytes.starts_with(SCRATCH_DISK_MARKER)
         })
         .collect::<Vec<_>>();
-    let device = Arc::clone(*candidates.first()?);
+    if candidates.is_empty() {
+        return None;
+    }
+    // Multiple marker disks would make the destructive target ambiguous.
+    assert_eq!(
+        candidates.len(),
+        1,
+        "marker scratch disks must be unique to keep the write target deterministic"
+    );
+    let device = Arc::clone(candidates[0]);
     log_write_device(&device, &scratch);
     Some((device, scratch))
 }
