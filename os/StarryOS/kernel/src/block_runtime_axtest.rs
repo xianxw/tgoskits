@@ -8,7 +8,6 @@ use core::{
 };
 
 use ax_fs_ng::{BlockDeviceHandle, BlockError, BlockRegion, block_batch_stats};
-use ax_runtime::hal::time::monotonic_time_nanos;
 use rdif_block::CompletedRequest;
 
 const SCRATCH_DISK_MARKER: &[u8] = b"TGOS_BLOCK_SCRATCH_V1\n";
@@ -64,9 +63,6 @@ fn block_batch_delta(before: BlockBatchSnapshot, after: BlockBatchSnapshot) -> B
     }
 }
 
-fn rate_per_second(count: u64, elapsed_ns: u64) -> u64 {
-    count.saturating_mul(1_000_000_000) / elapsed_ns.max(1)
-}
 fn assert_successful_read_bytes(request: &CompletedRequest, byte_len: usize) {
     assert_eq!(request.result, Ok(()));
     assert_eq!(
@@ -507,7 +503,6 @@ fn block_runtime_single_block_contiguous_read_write() -> axtest::AxTestResult {
         ScratchRegionGuard::new(Arc::clone(&device), lba, WRITE_TEST_BLOCKS, original);
     let pattern = pattern_bytes(info.logical_block_size, WRITE_TEST_BLOCKS, 0x31);
     let batch_before = block_batch_snapshot();
-    let start = monotonic_time_nanos();
 
     for index in 0..WRITE_TEST_BLOCKS {
         let offset = index as usize * info.logical_block_size;
@@ -533,7 +528,6 @@ fn block_runtime_single_block_contiguous_read_write() -> axtest::AxTestResult {
         assert_eq!(bytes, &pattern[offset..offset + info.logical_block_size]);
     }
 
-    let elapsed_ns = monotonic_time_nanos().saturating_sub(start).max(1);
     let batch = block_batch_delta(batch_before, block_batch_snapshot());
     assert_eq!(batch.submitted_requests, u64::from(WRITE_TEST_BLOCKS * 2));
     assert_eq!(batch.completed_requests, batch.submitted_requests);
@@ -543,13 +537,10 @@ fn block_runtime_single_block_contiguous_read_write() -> axtest::AxTestResult {
     scratch.restore();
 
     axtest::axtest_println!(
-        "BLOCK_SINGLE_RW_FUNCTIONAL lba={} blocks={} bytes={} elapsed_ns={} bytes_per_sec={} \
-         submitted={} completed={}",
+        "BLOCK_SINGLE_RW_FUNCTIONAL lba={} blocks={} bytes={} submitted={} completed={}",
         lba,
         WRITE_TEST_BLOCKS,
         pattern.len(),
-        elapsed_ns,
-        rate_per_second((pattern.len() as u64).saturating_mul(2), elapsed_ns),
         batch.submitted_requests,
         batch.completed_requests,
     );
@@ -568,7 +559,6 @@ fn run_multi_block_functional_test(
     let mut scratch = ScratchRegionGuard::new(Arc::clone(&device), lba, block_count, original);
     let pattern = pattern_bytes(info.logical_block_size, block_count, seed);
     let batch_before = block_batch_snapshot();
-    let start = monotonic_time_nanos();
 
     let write =
         crate::task::future::block_on(device.axtest_write_blocks(lba, block_count, &pattern))
@@ -585,7 +575,6 @@ fn run_multi_block_functional_test(
     data.copy_to_slice_cpu(&mut read_back);
     assert_eq!(read_back, pattern);
 
-    let elapsed_ns = monotonic_time_nanos().saturating_sub(start).max(1);
     let batch = block_batch_delta(batch_before, block_batch_snapshot());
     assert_eq!(batch.submitted_requests, 2);
     assert_eq!(batch.completed_requests, 2);
@@ -595,13 +584,10 @@ fn run_multi_block_functional_test(
     scratch.restore();
 
     axtest::axtest_println!(
-        "{label} lba={} blocks={} bytes={} elapsed_ns={} bytes_per_sec={} submitted={} \
-         completed={}",
+        "{label} lba={} blocks={} bytes={} submitted={} completed={}",
         lba,
         block_count,
         pattern.len(),
-        elapsed_ns,
-        rate_per_second((pattern.len() as u64).saturating_mul(2), elapsed_ns),
         batch.submitted_requests,
         batch.completed_requests,
     );
@@ -663,7 +649,6 @@ fn block_runtime_async_mixed_read_write() -> axtest::AxTestResult {
     let mut scratch = ScratchRegionGuard::new(Arc::clone(&device), lba, block_count, original);
     let pattern = pattern_bytes(info.logical_block_size, block_count / 2, 0xA5);
     let batch_before = block_batch_snapshot();
-    let start = monotonic_time_nanos();
     let mut futures: Vec<Option<(MixedExpectation, MixedFuture)>> = Vec::new();
 
     for index in 0..block_count {
@@ -735,7 +720,6 @@ fn block_runtime_async_mixed_read_write() -> axtest::AxTestResult {
         }
     }));
 
-    let elapsed_ns = monotonic_time_nanos().saturating_sub(start).max(1);
     let batch = block_batch_delta(batch_before, block_batch_snapshot());
     assert_eq!(batch.submitted_requests, u64::from(block_count));
     assert_eq!(batch.completed_requests, batch.submitted_requests);
@@ -763,13 +747,10 @@ fn block_runtime_async_mixed_read_write() -> axtest::AxTestResult {
     );
 
     axtest::axtest_println!(
-        "BLOCK_MIXED_RW_FUNCTIONAL lba={} blocks={} bytes={} elapsed_ns={} bytes_per_sec={} \
-         submitted={} completed={}",
+        "BLOCK_MIXED_RW_FUNCTIONAL lba={} blocks={} bytes={} submitted={} completed={}",
         lba,
         block_count,
         mixed_read_back.len(),
-        elapsed_ns,
-        rate_per_second(mixed_read_back.len() as u64, elapsed_ns),
         batch.submitted_requests,
         batch.completed_requests,
     );
