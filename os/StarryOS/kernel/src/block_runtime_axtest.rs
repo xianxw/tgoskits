@@ -10,13 +10,14 @@ use core::{
 use ax_fs_ng::{BlockDeviceHandle, BlockError, BlockRegion, block_batch_stats};
 use rdif_block::CompletedRequest;
 
-const SCRATCH_DISK_MARKER: &[u8] = b"TGOS_BLOCK_SCRATCH_V1\n";
+use crate::block_scratch_policy::{
+    SCRATCH_DISK_MARKER, declared_scratch_device_eligible, marker_scratch_device_eligible,
+    marker_scratch_region,
+};
+
 const WRITE_TEST_BLOCKS: u32 = 8;
 const MIXED_TEST_BLOCKS: u32 = 8;
 const MULTI_DESCRIPTOR_TEST_BLOCKS: u32 = 16;
-/// The functional sub-regions ([0, 24)) and the multi-descriptor test
-/// ([24, 40)) must all fit the runtime-resolved scratch region.
-const SCRATCH_MIN_REGION_BLOCKS: u32 = 40;
 
 #[derive(Clone, Copy, Debug, Default)]
 struct BlockBatchSnapshot {
@@ -80,13 +81,16 @@ fn assert_successful_read(request: &CompletedRequest, block_size: usize) {
 /// failing. Two discovery paths exist:
 ///
 /// 1. An operator-declared reserved region on the root card, requested on the
-///    kernel command line as `axtest.block_scratch=<start_lba>:<blocks>`. The
-///    region must hold at least [`SCRATCH_MIN_REGION_BLOCKS`] blocks and must
-///    not overlap any partition of the root disk. A request that fails its
-///    eligibility checks is a hard error: the operator explicitly asked for
-///    the destructive tests to run.
+///    kernel command line as `axtest.block_scratch=<start_lba>:<blocks>`. A
+///    request that fails its eligibility checks is a hard error: the operator
+///    explicitly asked for the destructive tests to run.
 /// 2. A dedicated non-root disk whose first sector starts with the scratch
 ///    marker, usable without any command-line configuration.
+///
+/// The per-device eligibility rules (writable 512-byte geometry, minimum
+/// extent, device boundary, root identity and no overlap with any mounted
+/// partition) are pure functions in [`crate::block_scratch_policy`] with
+/// deterministic unit tests; only device I/O stays here.
 fn writable_test_device() -> Option<(Arc<BlockDeviceHandle>, BlockRegion)> {
     let devices = BlockDeviceHandle::axtest_devices()
         .expect("block runtime must be installed for block axtest");
@@ -98,38 +102,13 @@ fn writable_test_device() -> Option<(Arc<BlockDeviceHandle>, BlockRegion)> {
         Some(Ok(scratch)) => {
             let candidates = devices
                 .iter()
-                .filter(|device| !device.device_info().read_only)
                 .filter(|device| {
-                    let info = device.device_info();
-                    // The region must be large enough for every test layout
-                    // (the functional sub-regions and the multi-descriptor test
-                    // together need 40 blocks).
-                    info.logical_block_size == 512
-                        && scratch.num_blocks() >= u64::from(SCRATCH_MIN_REGION_BLOCKS)
-                        && scratch.end_lba <= info.num_blocks
-                })
-                .filter(|device| {
-                    // The reserved extent lives on the root SD card; do not fall
-                    // back to an unrelated writable disk whose fixed LBA range has
-                    // not been explicitly identified as scratch space.
-                    ax_fs_ng::root::axtest_is_root_device(device)
-                })
-                .filter(|device| {
-                    let Some(root) = ax_fs_ng::root::axtest_root_region(device) else {
-                        return false;
-                    };
-                    scratch.end_lba <= root.start_lba || root.end_lba <= scratch.start_lba
-                })
-                .filter(|device| {
-                    // init_root mounts every other recognized partition on this
-                    // disk too (a /boot partition, for example), so the scratch
-                    // extent must avoid all of them, not just the root one.
-                    ax_fs_ng::root::axtest_disk_partition_regions(device)
-                        .iter()
-                        .all(|partition| {
-                            scratch.end_lba <= partition.start_lba
-                                || partition.end_lba <= scratch.start_lba
-                        })
+                    declared_scratch_device_eligible(
+                        device.device_info(),
+                        *scratch,
+                        ax_fs_ng::root::axtest_root_region(device),
+                        ax_fs_ng::root::axtest_disk_partition_regions(device),
+                    )
                 })
                 .collect::<Vec<_>>();
             assert_eq!(
@@ -140,7 +119,7 @@ fn writable_test_device() -> Option<(Arc<BlockDeviceHandle>, BlockRegion)> {
                 scratch.end_lba,
             );
             let device = Arc::clone(candidates[0]);
-            log_write_device(&device, &scratch);
+            log_write_device(&device, scratch);
             return Some((device, *scratch));
         }
         Some(Err(reason)) => {
@@ -149,28 +128,16 @@ fn writable_test_device() -> Option<(Arc<BlockDeviceHandle>, BlockRegion)> {
         None => {}
     }
 
-    let scratch = BlockRegion::new(1, u64::from(SCRATCH_MIN_REGION_BLOCKS));
+    let scratch = marker_scratch_region();
     let candidates = devices
         .iter()
         .filter(|device| {
-            !ax_fs_ng::root::axtest_is_root_device(device) && !device.device_info().read_only
-        })
-        .filter(|device| {
             let info = device.device_info();
-            if info.num_blocks < scratch.end_lba
-                || info.logical_block_size < SCRATCH_DISK_MARKER.len()
-            {
-                return false;
-            }
-            // init_root mounts every recognized partition on this disk too,
-            // so the fixed scratch extent must not overlap any of them
-            // before raw writes are allowed.
-            if !ax_fs_ng::root::axtest_disk_partition_regions(device)
-                .iter()
-                .all(|partition| {
-                    scratch.end_lba <= partition.start_lba || partition.end_lba <= scratch.start_lba
-                })
-            {
+            if !marker_scratch_device_eligible(
+                info,
+                ax_fs_ng::root::axtest_is_root_device(device),
+                ax_fs_ng::root::axtest_disk_partition_regions(device),
+            ) {
                 return false;
             }
             let Ok(marker) = device.axtest_read_sync(0) else {

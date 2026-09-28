@@ -330,7 +330,9 @@ pub fn axtest_disk_partition_regions(handle: &BlockDeviceHandle) -> &'static [Bl
         .unwrap_or(&[])
 }
 
-#[cfg(axtest)]
+// The parser is pure, so host unit tests compile it alongside the axtest
+// builds to cover the fallback and hard-error contract deterministically.
+#[cfg(any(axtest, test))]
 fn parse_axtest_scratch_region(bootargs: Option<&str>) -> Option<Result<BlockRegion, String>> {
     // Absent on the command line -> None (the caller falls back). A present
     // but malformed declaration is reported as Err so the destructive tests
@@ -1548,5 +1550,42 @@ mod tests {
         assert_eq!(default_root_source(emmc, 0, Some(0)), "/dev/mmcblk0p1");
         assert_eq!(default_root_source(ahci, 0, None), "/dev/sda");
         assert_eq!(default_root_source(ahci, 1, Some(0)), "/dev/sdb1");
+    }
+
+    #[test]
+    fn missing_scratch_declaration_falls_back_to_the_marker_disk() {
+        assert!(parse_axtest_scratch_region(None).is_none());
+        assert!(parse_axtest_scratch_region(Some("root=/dev/mmcblk0p1 quiet")).is_none());
+    }
+
+    #[test]
+    fn malformed_scratch_declarations_are_reported_not_folded_into_fallback() {
+        for (declaration, expected_fragment) in [
+            ("axtest.block_scratch=2099200", "expects"),
+            ("axtest.block_scratch=abc:256", "start_lba"),
+            ("axtest.block_scratch=2099200:xyz", "blocks"),
+            ("axtest.block_scratch=2099200:0", "nonzero"),
+        ] {
+            let requested = parse_axtest_scratch_region(Some(declaration))
+                .expect("a present declaration must not collapse to the fallback path");
+            let error = requested
+                .as_ref()
+                .expect_err("malformed declarations must be errors");
+            assert!(
+                error.contains(expected_fragment),
+                "declaration {declaration:?} produced unrelated error {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn valid_scratch_declaration_resolves_to_a_half_open_region() {
+        let region =
+            parse_axtest_scratch_region(Some("console=ttyS0 axtest.block_scratch=2099200:256"))
+                .expect("declaration present")
+                .expect("well-formed declaration");
+        assert_eq!(region.start_lba, 2_099_200);
+        assert_eq!(region.end_lba, 2_099_456);
+        assert_eq!(region.num_blocks(), 256);
     }
 }
