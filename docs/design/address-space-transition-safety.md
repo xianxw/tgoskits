@@ -206,12 +206,23 @@ PTE 的 frame 必须进入 gather。
 
 数据 frame 之外，中间页表 frame 也属于同一回收屏障。清除最后一个 leaf 后，远端 CPU 可能仍
 持有旧 translation 或 page-walk cache；因此不能在 IPI ACK 前释放变空的下级页表。generic 层的
-`unmap_page_deferred()` 只负责清 leaf 并返回 move-only `DeferredPageTableFrames`，不执行 shootdown；
-ax-mm/Starry gather 接管 token，确认后才调用 `reclaim()`。token 未确认即 Drop 时只记录诊断并泄漏，
-禁止把超时降级为 table-page UAF。generic 原有 `unmap_page()`/range unmap 继续按其调用域完成本地
-flush 并即时回收空中间表，供 Axvisor stage-2 和单 owner 页表使用；不能把 stage-1 的远端确认策略
-反向强加给这些调用方，导致反复 map/unmap 时页表帧累积到 root teardown。所有 published stage-1
-调用点必须显式选择 deferred API，不能依赖 generic 层的本地 flush 推断远端 CPU 已经失效。
+`unmap_page_deferred()` 复用 `unmap_range_deferred()` 的范围遍历，清除 leaf 并返回 move-only
+`DeferredPageTableFrames`，不执行 shootdown；ax-mm/Starry gather 接管 token，确认后才调用
+`reclaim()`。token 未确认即 Drop 时只记录诊断并泄漏，禁止把超时降级为 table-page UAF。
+普通 `unmap_page()` 只完成调用域内的 leaf flush，并保留空中间表供后续复用或 root 安全销毁，
+不会在远端 walker 仍可能访问时立即释放子表。`virtualization/axvm/src/npt.rs` 的
+`LeveledPageTable::unmap()` 当前调用此单页入口，因此同一个 VM 在不同 2 MiB 区域反复映射、
+解映射 4 KiB 页时，每个曾使用的区域最多可保留一个空的末级表，祖先表也会保留到 root 销毁；
+这不是脱离 root 的泄漏，但页表帧占用可能随曾访问的稀疏地址范围增长。需要通过 Axvisor 的
+`PagingHandler::alloc_frame()`/`dealloc_frame()` 观察这类负载的页表帧余额与 VM 析构后的回落，
+不能只观察当前仍映射的页数。
+
+generic 的范围入口 `unmap()`/`unmap_with_config()` 仍按调用域失效并即时回收空中间表；
+`LeveledPageTable::unmap_region()` 调用该入口。只有调用方已独占相应硬件 walker 的使用权，
+或已完成覆盖它们的失效确认，才能依赖这种即时回收。Axvisor 若要为单页高 churn 路径恢复
+即时回收，应先把这一前提落实为可检查的调用契约和对应测试，再选择范围入口或专用 API；
+不能把 stage-1 的远端确认策略反向强加给所有调用方。所有 published stage-1 调用点必须
+显式选择 deferred API，不能依赖 generic 层的本地 flush 推断远端 CPU 已经失效。
 尚未发布的多页 map 失败前缀仍可由 generic rollback 立即回收，因为没有 CPU 或 hardware walker
 能够观察该临时层级。
 
@@ -245,9 +256,52 @@ DMA coherent alias 的 release 是例外：它的调用者会在 unmap 返回成
 返回；未确认的远端仍由 quarantine 阻止 frame/VA 回收和复用。
 
 shootdown 确认之前还必须存在独立的“页表写入已发布”边。AArch64 发起 CPU 在任何本地 TLBI 或
-远端 IPI 前执行 `dsb ishst`；每个目标 CPU 只执行本地
-`dsb nshst → TLBI → dsb nsh → isb`。`ax-cpu` 因而不使用 `vaae1is/vae2is` 隐式广播，CPU mask、
-online 状态和确认统一由 ax-hal/runtime 软件 shootdown 事务拥有。若只在远端回调中执行 DSB，
+远端 IPI 前执行 `dsb ishst`；每个目标 CPU 的常规失效只执行本地
+`dsb nshst → TLBI → dsb nsh → isb`。`ArchPagingMeta::flush_batch` 和
+`El2PagingMeta::flush_batch` 保持本核语义，CPU mask、online 状态、失效确认和资源回收仍由
+ax-hal/runtime 软件 shootdown 事务拥有。break-before-make 的预写入硬件事务由
+`ax_hal::paging::ArchPagingMeta` 实施；`ax_cpu::paging::{ArchPagingMeta, El2PagingMeta}`
+只保留本地失效，`ax_cpu::mmu::{El1, El2}` 提供底层 TLBI 指令原语：
+`Frame::remap_recursive` 更换物理页，以及 huge leaf 与子表互换时，必须先清除旧描述符，再由
+`TableMeta::flush_before_make` 在平台声明的失效域完成同步，最后才能写入新描述符；
+`TableMeta::publish_new_mapping` 再完成新项的可见性屏障。AArch64 EL1/EL2
+对单页分别使用 `vaae1is`/`vae2is`，对覆盖多个翻译的 huge 变更使用全域失效；这些同步 TLBI
+按 `dsb ishst → TLBI ...IS → dsb ish → isb` 完成。后一个 `dsb ish` 等待同一
+Inner Shareable 域内目标 PE 的 TLBI 完成，因此在该域内为写入新描述符提供
+break-before-make 完成边界；它不是按 CPU 返回的运行时回执。该广播范围与指令序列见
+[Arm 内存管理指南](https://developer.arm.com/-/media/Arm%20Developer%20Community/PDF/Learn%20the%20Architecture/LearnTheArchitecture-MemoryManagement-101811_0100_00_en.pdf)，
+`DSB ISH` 的 TLBI 完成语义见
+[Arm ARM 已知问题说明](https://documentation-service.arm.com/static/69aac74fe79f9a1d642aa91f)。所有可能同时使用这张
+stage-1 页表的 PE 必须属于同一域，平台配置不能仅凭 `TCR_EL1.SH0/SH1` 或
+`TCR_EL2.SH0` 设为 Inner 就推断这一点。如果平台不能保证同域，必须在写入新项前
+另行完成覆盖所有使用者的失效，例如两阶段软件 shootdown 或平台专用的更宽域操作。
+`ax-plat::mem::StageOneTlbDomain` 将这一硬件前提交给平台实现声明；
+`ax-hal` 在每次清旧描述符之前检查域，不从 FDT 根兼容串推断，也不设置跨页表实例的
+全局开关。动态 AArch64 平台按 Linux 兼容的 SMP 启动契约声明
+`InnerShareable`，不以 FDT 根兼容串或单个构建配置决定能否执行 BBM。
+[Linux AArch64 启动协议](https://docs.kernel.org/arch/arm64/booting.html)要求所有将由
+内核启动的 CPU 在入内核前属于同一 coherency domain，并能接收维护操作；
+[Linux v7.1 的 TLB 实现](https://github.com/torvalds/linux/blob/8cd9520d35a6c38db6567e97dd93b1f11f185dc6/arch/arm64/include/asm/tlbflush.h)
+使用 `DSB ISHST → TLBI ...IS → DSB ISH` 覆盖共享页表的处理器。本平台实现采用
+相同的硬件前提，保留原有多核启动能力。动态 AArch64 平台不会将多核构建静默降为单核。
+若固件或 interconnect 不满足这一启动契约，该平台不能按当前配置安全运行多核页表替换。
+`someboot` 的 AArch64 EL1/EL2 启动后端已在各自的 `flush_tlb(Some(_))` 中使用
+Inner Shareable TLBI；`ax_cpu::mmu::{El1, El2}::configure_stage1` 也把页表遍历配置为
+Inner Shareable。这些源码只表明软件采用该启动契约，不能单凭寄存器设置证明硬件域的覆盖范围。
+Linux 的启动前提与 TLBI 实现共同说明所采用的软件契约，但不能单凭寄存器设置或协议文本
+证明每块实体板卡的固件和 interconnect 实际满足该契约。当前 QEMU 回归覆盖跨核替换；
+RK3588 Orange Pi 5 Plus、PhytiumPi、Rock 4D、ROC-RK3568-PC 与 ACPI 启动仍需实体回归。
+为检查平台判定不再依赖 FDT 根兼容串，在 QEMU virt 512 MiB、4 CPU 的自动生成 FDT 中，
+仅将根节点 `compatible` 从 `linux,dummy-virt` 改成未列名的
+`tgoskits,unlisted-virt`，保留设备节点与 QEMU 配置；运行期
+`mm-transition-safety` 的跨核权限转换、两核 COW 和 refault 均通过，输出
+`STARRY_SYSTEM_TEST_PASSED: /usr/bin/starry-test-suit/mm-transition-safety`。
+这一回归只证明动态 AArch64 QEMU 构建在未知根兼容串下不触发
+`prepare_break_before_make()` 的缺页失败；
+QEMU 的同域行为不能代替上述实体平台的 interconnect 与固件验证。
+该硬件完成边界不提供目标 CPU 的 online 状态、逐目标失败报告或 owner 回收许可；
+frame/VA/backend/page-cache owner 的释放仍依赖 ax-hal/runtime 的目标确认、失败
+quarantine 和最终 shootdown。若只在远端回调中执行 DSB，
 它不能排序发起 CPU 先前清除 parent PTE 的写入：远端可能在 ACK 后仍走旧 table 层级，而 gather
 随即回收并复用中间页表 frame，形成 page-walk use-after-free。CI run `33142588973` 中随后出现的
 AArch64 `IrqWaitCell::wake_registration` 无关对象损坏与这一缺口的下游表现一致；同配置 ELF 将
@@ -382,8 +436,9 @@ TGOSKits 不照搬 Linux 的散布式 C 宏和隐式约定，而是保留其语�
 
 - ax-mm：shootdown 失败时 frame 不 reclaim，重试确认后才 reclaim；partial populate rollback 中
   已发布 frame 同样 deferred；DMA alias 的 confirmed unmap 失败必须阻止原物理页回到 allocator；
-  page-table-generic 的 red/green 回归证明普通 leaf/range unmap 和未发布 map rollback 不积累空表，
-  同时 deferred leaf 删除在确认前不释放变空的中间页表；AArch64 源级合同固定发起 CPU 的
+  page-table-generic 的 red/green 回归证明普通 range unmap 和未发布 map rollback 不积累空表，
+  普通单页 unmap 保留空子表供后续复用或 root 销毁，deferred leaf 删除在确认前也不释放
+  变空的中间页表；AArch64 源级合同固定发起 CPU 的
   `dsb ishst` 早于任何
   目标失效，并固定本地 `dsb nshst → TLBI → dsb nsh → isb` 顺序，ax-hal 模型同时证明即使发起
   CPU 不在 active mask 中，写入发布仍早于第一条远端 IPI；

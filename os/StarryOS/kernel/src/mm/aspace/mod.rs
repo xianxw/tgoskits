@@ -1313,9 +1313,25 @@ impl AddrSpace {
                 _ => StarryError::BadState,
             })?;
 
-        let deposit = old_slot
+        let mut deposit = old_slot
             .take_huge_split_deposit()
             .ok_or(StarryError::BadState)?;
+        if deposit.requires_tlb_confirmation() {
+            if ax_runtime::hal::cache::flush_tlb_range_all_cpus(
+                block_range.start,
+                block_range.size(),
+            )
+            .is_err()
+            {
+                if old_slot.restore_huge_split_deposit(deposit).is_err() {
+                    self.mutation_gate.mark_needs_repair();
+                }
+                return Err(StarryError::BadState);
+            }
+            // SAFETY: the all-ready-CPU shootdown completed before taking the
+            // IRQ-saving PTE stripe. CPUs joining later flush on publication.
+            unsafe { deposit.confirm_tlb_retirement() };
+        }
         let mutation_gate = &self.mutation_gate;
         let pte_domain = &self.pte_domain;
         let pt = &mut self.pt;
@@ -5755,6 +5771,10 @@ impl AddrSpace {
         }
         let slots = core::mem::take(&mut self.mapping_slots);
         for slot in slots.into_values() {
+            // SAFETY: the retired root has no hardware users, or this loader
+            // image was never installed; the check above excludes pending
+            // shootdowns and retained page-table owners.
+            unsafe { slot.confirm_quiescent_huge_split_deposit() };
             slot.detach();
         }
         self.resident_watermark.reset();

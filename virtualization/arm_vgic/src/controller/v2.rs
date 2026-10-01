@@ -104,9 +104,10 @@ impl GicV3Controller {
             _ if is_private_register(offset) => {
                 let wakes = {
                     let mut state = self.inner.state.lock_irqsave();
+                    let loaded = state.cpu_interface_loaded(vcpu);
                     let candidates = state
                         .redistributor_mut(vcpu, "write GICv2 private Distributor register")?
-                        .write_private_register(offset, width, value, &self.inner.config)?;
+                        .write_private_register(offset, width, value, &self.inner.config, loaded)?;
                     let mut wakes = Vec::new();
                     for intid in candidates {
                         if let Some(wake) = state.queue_local_if_deliverable(vcpu, intid)? {
@@ -344,6 +345,7 @@ impl GicV3Controller {
         )?;
         let wakes = {
             let mut state = self.inner.state.lock_irqsave();
+            let loaded = state.cpu_interface_loaded(vcpu);
             let mut wakes = Vec::new();
             for byte in 0..width.size() {
                 let sgi = SgiId::new((offset - bank) as u8 + byte as u8)?;
@@ -362,7 +364,7 @@ impl GicV3Controller {
                 } else {
                     state
                         .redistributor_mut(vcpu, "clear SGI source-pending register")?
-                        .clear_sgi_sources(sgi, mask);
+                        .clear_sgi_sources(sgi, mask, loaded);
                 }
             }
             wakes
@@ -480,8 +482,11 @@ impl GicV3Controller {
             return Ok(());
         };
         match retirement {
-            DeliveryRetirement::Emulated { intid } => {
-                backend_result(self.inner.backend.retire_emulated_interrupt(vcpu, intid))
+            DeliveryRetirement::Emulated { intid, wake } => {
+                let result =
+                    backend_result(self.inner.backend.retire_emulated_interrupt(vcpu, intid));
+                let wake_result = wake.map_or(Ok(()), |wake| wake.wake());
+                result.and(wake_result)
             }
             DeliveryRetirement::Physical { binding } => self.complete_physical_spi(vcpu, binding),
         }

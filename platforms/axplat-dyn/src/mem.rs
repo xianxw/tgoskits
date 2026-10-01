@@ -1,7 +1,8 @@
 use ax_lazyinit::OnceLock;
 use ax_plat::mem::{
     CpuSharedMemoryModel, DCacheOp, IomapAttrs, IomapDecision, IomapError, MemIf, PhysAddr,
-    RawRange, VirtAddr, VirtAddrRange, VirtualAddressSpaceError, VirtualAddressSpaceLayout,
+    RawRange, StageOneTlbDomain, VirtAddr, VirtAddrRange, VirtualAddressSpaceError,
+    VirtualAddressSpaceLayout,
 };
 use heapless::Vec;
 use someboot::ArchTrait;
@@ -95,6 +96,21 @@ impl MemIf for MemIfImpl {
         )))]
         {
             CpuSharedMemoryModel::Unsupported
+        }
+    }
+
+    fn stage_one_tlb_domain() -> StageOneTlbDomain {
+        #[cfg(target_arch = "aarch64")]
+        {
+            // Linux-compatible AArch64 SMP boot requires all CPUs that may run
+            // the kernel to receive maintenance in one coherent domain. Ports
+            // must also place shared stage-one users in one Inner Shareable domain.
+            StageOneTlbDomain::InnerShareable
+        }
+
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            StageOneTlbDomain::Unavailable
         }
     }
 

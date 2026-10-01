@@ -316,13 +316,15 @@ impl RedistributorState {
             }
             return false;
         }
-        if let Some(entry) = self
+        if let Some(index) = self
             .cpu_interface
-            .list_registers_mut()
-            .iter_mut()
-            .flatten()
-            .find(|entry| entry.intid() == delivery.intid)
+            .list_registers()
+            .iter()
+            .position(|entry| entry.is_some_and(|entry| entry.intid() == delivery.intid))
         {
+            let entry = self.cpu_interface.list_registers_mut()[index]
+                .as_mut()
+                .expect("the matched LR slot must remain occupied");
             if entry.backing() == delivery.backing
                 && !matches!(entry.backing(), ListRegisterBacking::Physical(_))
             {
@@ -331,50 +333,16 @@ impl RedistributorState {
                     InterruptState::Active => InterruptState::ActivePending,
                     state => state,
                 });
+                self.cpu_interface.clear_pending_withdrawal(index);
             }
             return false;
         }
         true
     }
 
-    pub(crate) fn clear_pending_delivery(&mut self, intid: IntId) -> bool {
+    pub(crate) fn withdraw_pending_delivery(&mut self, intid: IntId, loaded: bool) -> bool {
         self.clear_queued_pending(intid);
-        let mut canceled = false;
-        for slot in self.cpu_interface.list_registers_mut() {
-            let Some(entry) = slot.as_mut().filter(|entry| entry.intid() == intid) else {
-                continue;
-            };
-            match entry.state() {
-                crate::InterruptState::Pending => {
-                    *slot = None;
-                    canceled = true;
-                }
-                crate::InterruptState::ActivePending => {
-                    entry.set_state(crate::InterruptState::Active);
-                }
-                crate::InterruptState::Inactive | crate::InterruptState::Active => {}
-            }
-        }
-        canceled
-    }
-
-    pub(crate) fn withdraw_pending_delivery(&mut self, intid: IntId) -> bool {
-        self.clear_queued_pending(intid);
-        let mut canceled = false;
-        for slot in self.cpu_interface.list_registers_mut() {
-            let Some(entry) = slot.as_mut().filter(|entry| entry.intid() == intid) else {
-                continue;
-            };
-            match entry.state() {
-                InterruptState::Pending => {
-                    *slot = None;
-                    canceled = true;
-                }
-                InterruptState::ActivePending => entry.set_state(InterruptState::Active),
-                InterruptState::Inactive | InterruptState::Active => {}
-            }
-        }
-        canceled
+        self.cpu_interface.withdraw_pending_delivery(intid, loaded)
     }
 
     pub(crate) fn pending_count(&self) -> usize {
@@ -448,6 +416,15 @@ impl RedistributorState {
         &mut self,
         mut spi_priority: impl FnMut(SpiId) -> VgicResult<Priority>,
     ) -> VgicResult<RefillOutcome> {
+        if self.queued_deliveries.is_empty() {
+            // Existing LR deliveries are already marked in flight. With no
+            // software overflow there is nothing to rank, move, or re-mark.
+            self.configure_delivery_traps();
+            return Ok(RefillOutcome {
+                loaded: Vec::new(),
+                spilled_pending: Vec::new(),
+            });
+        }
         let lr_count = self.cpu_interface.list_registers().len();
         let queued_priorities = self
             .queued_deliveries
@@ -667,7 +644,10 @@ impl RedistributorState {
         // While a vCPU is loaded, the hardware LRs own their delivery state.
         // Keep the saved LR identity intact until `save` harvests guest EOI;
         // only the input level may change at this point.
-        if !asserted && !cpu_interface_loaded && self.clear_pending_delivery(IntId::Ppi(ppi)) {
+        if !asserted
+            && !cpu_interface_loaded
+            && self.withdraw_pending_delivery(IntId::Ppi(ppi), false)
+        {
             self.private_interrupts[index].cancel_inflight();
         }
     }
@@ -706,13 +686,18 @@ impl RedistributorState {
         self.sgi_sources[sgi.raw() as usize]
     }
 
-    pub(crate) fn clear_sgi_sources(&mut self, sgi: SgiId, mask: u8) -> bool {
+    pub(crate) fn clear_sgi_sources(
+        &mut self,
+        sgi: SgiId,
+        mask: u8,
+        cpu_interface_loaded: bool,
+    ) -> bool {
         self.sgi_sources[sgi.raw() as usize] &= !mask;
         let empty = !self.has_sgi_sources(sgi);
         if empty {
             let intid = IntId::Sgi(sgi);
             self.private_interrupts[sgi.raw() as usize].set_pending(false);
-            if self.clear_pending_delivery(intid) {
+            if self.withdraw_pending_delivery(intid, cpu_interface_loaded) {
                 self.private_interrupts[sgi.raw() as usize].cancel_inflight();
             }
         }

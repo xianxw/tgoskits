@@ -880,10 +880,9 @@ pub struct MappingSlot {
     /// page can change from File to Anon at one VA while other mappings of the
     /// same logical object keep their own classification.
     resident_kind: AtomicU8,
-    /// Preallocated child table bound to this slot's huge leaf.  It is never
-    /// visible to hardware until a typed split consumes it.  Dropping a whole
-    /// huge mapping therefore releases the unpublished deposit without a TLB
-    /// obligation, matching Linux's deposited-PTE-page ownership.
+    /// Preallocated child table bound to this slot's huge leaf. A freshly
+    /// prepared deposit has never been visible to hardware; a deposit returned
+    /// by rollback remains retired until remote TLB confirmation.
     huge_split_deposit: IrqMutex<Option<HugeSplitDeposit>>,
     state: AtomicU8,
 }
@@ -981,6 +980,19 @@ impl MappingSlot {
         }
         *owner = Some(deposit);
         Ok(())
+    }
+
+    /// Confirms retirement of a restored child table before slot teardown.
+    ///
+    /// # Safety
+    ///
+    /// The address-space owner must prove that no CPU can still use this page
+    /// table root, including a pending walk or unacknowledged TLB request.
+    pub(crate) unsafe fn confirm_quiescent_huge_split_deposit(&self) {
+        if let Some(deposit) = self.huge_split_deposit.lock().as_mut() {
+            // SAFETY: the caller supplies the root-wide quiescence proof.
+            unsafe { deposit.confirm_tlb_retirement() };
+        }
     }
 
     pub(crate) fn overlaps(&self, range: VirtAddrRange) -> bool {
